@@ -76,10 +76,14 @@ const main = async () => {
       const auctionId = 'auction1';
       const item = 'Pic#1';
       const startingBid = 75;
+
       if (isNaN(startingBid)) {
         throw new Error('Starting bid must be a valid number');
       }
+
       console.log(`Requesting open-auction with auctionId: ${auctionId}, item: ${item}, startingBid: ${startingBid}`);
+      console.log(`serverPubKey: ${serverPubKey.toString('hex')}`);
+      console.log(`Arguments: ${JSON.stringify({ auctionId, item, startingBid })}`);
       await rpc.request(serverPubKey, 'open-auction', { auctionId, item, startingBid });
     } catch (err) {
       console.error('Error during open-auction request:', err);
