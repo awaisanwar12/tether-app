@@ -4,60 +4,62 @@ const DHT = require('hyperdht');
 const Hypercore = require('hypercore');
 const Hyperbee = require('hyperbee');
 const crypto = require('crypto');
-const auction = require('./auction');
+const Auction = require('./auction');
+
+const peers = []; // List of known peers
 
 const main = async () => {
-  // hyperbee db
-  const hcore = new Hypercore('./db/rpc-server');
-  const hbee = new Hyperbee(hcore, { keyEncoding: 'utf-8', valueEncoding: 'json' });
+  const auction = new Auction('./db/rpc-server');
+  await auction.init();
 
-  // Wait for hyperbee to be ready
-  try {
-    await hbee.ready();
-  } catch (err) {
-    console.error('Failed to initialize Hyperbee:', err);
-    process.exit(1);
-  }
+  const seedLength = 32;
+  const seed = crypto.randomBytes(seedLength);
+  const keyPair = DHT.keyPair(seed);
 
-  // resolved distributed hash table seed for key pair
-  let dhtSeed = (await hbee.get('dht-seed'))?.value;
-  if (!dhtSeed || dhtSeed.length !== 32) {
-    // not found, generate and store in db
-    dhtSeed = crypto.randomBytes(32); // Ensure the seed length matches the required length
-    await hbee.put('dht-seed', dhtSeed);
-  }
-
-  // Convert the seed to a Uint8Array
-  const seedTypedArray = new Uint8Array(dhtSeed);
-
-  // start distributed hash table, it is used for rpc service discovery
   const dht = new DHT({
     port: 40001,
-    keyPair: DHT.keyPair(seedTypedArray),
-    bootstrap: [{ host: '127.0.0.1', port: 30001 }] // note bootstrap points to dht that is started via cli
+    keyPair: keyPair,
+    bootstrap: [{ host: '127.0.0.1', port: 30001 }]
   });
   await dht.ready();
 
-  // resolve rpc server seed for key pair
-  let rpcSeed = (await hbee.get('rpc-seed'))?.value;
-  if (!rpcSeed || rpcSeed.length !== 32) {
-    rpcSeed = crypto.randomBytes(32);
-    await hbee.put('rpc-seed', rpcSeed);
-  }
-
-  // Convert the rpcSeed to a Uint8Array
-  const rpcSeedTypedArray = new Uint8Array(rpcSeed);
-
-  // setup rpc server
-  const rpc = new RPC({ seed: rpcSeedTypedArray, dht });
+  const rpc = new RPC({ dht });
   const rpcServer = rpc.createServer();
-  await rpcServer.listen();
-  console.log('rpc server started listening on public key:', rpcServer.publicKey.toString('hex'));
 
-  // bind handlers to rpc server
-  rpcServer.respond('open-auction', auction.openAuction);
-  rpcServer.respond('place-bid', auction.placeBid);
-  rpcServer.respond('close-auction', auction.closeAuction);
+  rpcServer.respond('open-auction', async (req) => {
+    const { auctionId, item, startingBid } = req;
+    const result = await auction.openAuction(auctionId, item, startingBid);
+    await broadcastAction(rpc,'open-auction', { auctionId, item, startingBid });
+    return result;
+  });
+
+  rpcServer.respond('place-bid', async (req) => {
+    const { auctionId, bidder, amount } = req;
+    const result = await auction.placeBid(auctionId, bidder, amount);
+    await broadcastAction(rpc,'place-bid', { auctionId, bidder, amount });
+    return result;
+  });
+
+  rpcServer.respond('close-auction', async (req) => {
+    const { auctionId } = req;
+    const result = await auction.closeAuction(auctionId);
+    await broadcastAction(rpc,'close-auction', { auctionId });
+    return result;
+  });
+
+  await rpcServer.listen();
+  console.log('RPC server listening on public key:', rpcServer.publicKey.toString('hex'));
+};
+
+const broadcastAction = async (action, data,rpc) => {
+  for (const peer of peers) {
+    try {
+      console.log(`Broadcasting action ${action} to peer ${peer.toString('hex')} with data: ${JSON.stringify(data)}`);
+      await rpc.request(peer, action, data);
+    } catch (err) {
+      console.error(`Failed to broadcast action to peer ${peer.toString('hex')}:`, err);
+    }
+  }
 };
 
 main().catch(console.error);

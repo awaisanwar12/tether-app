@@ -1,81 +1,128 @@
 'use strict';
-const Hypercore = require('hypercore'); 
+const Hypercore = require('hypercore');
+const Hyperbee = require('hyperbee');
 const RPC = require('@hyperswarm/rpc');
 const DHT = require('hyperdht');
 const crypto = require('crypto');
-const Hyperbee = require('hyperbee');
-const auction = require('./auction');
+const Auction = require('./auction');
 const retry = require('async-retry');
 
+const peers = []; // List of known peers
+
 const main = async () => {
-  // hyperbee db
-  const hcore = new Hypercore('./db/rpc-client');
-  const hbee = new Hyperbee(hcore, { keyEncoding: 'utf-8', valueEncoding: 'json' });
-  await hbee.ready();
+  const auctionFeed = new Hypercore('./db/auction-data');
+  await auctionFeed.ready();
+  const auctionDB = new Hyperbee(auctionFeed, { keyEncoding: 'utf-8', valueEncoding: 'json' });
 
-  const seedLength = 32; // Define the required seed length
-  const seed = crypto.randomBytes(seedLength); // Ensure the seed length matches the required length
-
-  // Use the seed to create the key pair
+  const seedLength = 32;
+  const seed = crypto.randomBytes(seedLength);
   const keyPair = DHT.keyPair(seed);
 
-  let dht;
-  let rpc;
+  const dht = new DHT({
+    port: 50001,
+    keyPair: keyPair,
+    bootstrap: [{ host: '127.0.0.1', port: 30001 }]
+  });
+  await dht.ready();
 
-  const initializeDHTandRPC = async () => {
-    dht = new DHT({
-      port: 50001,
-      keyPair: keyPair,
-      bootstrap: [{ host: '127.0.0.1', port: 30001 }]
-    });
-    await dht.ready();
+  const rpc = new RPC({ dht });
+  const rpcServer = rpc.createServer();
 
-    rpc = new RPC({ dht });
-  };
+  rpcServer.respond('open-auction', async (req) => {
+    const { auctionId, item, startingBid } = req;
+    console.log(`Received open-auction request with auctionId: ${auctionId}, item: ${item}, startingBid: ${startingBid}`);
+    if (!auctionId || !item || isNaN(startingBid)) {
+      throw new Error('Invalid arguments for open-auction');
+    }
+    await auctionDB.put(auctionId, { item, startingBid, bids: [] });
+    await broadcastAction(rpc, 'open-auction', { auctionId, item, startingBid });
+    return { success: true };
+  });
 
-  const handleChannelClosed = async () => {
-    await rpc.destroy();
-    await dht.destroy();
-    await initializeDHTandRPC();
-  };
+  rpcServer.respond('place-bid', async (req) => {
+    const { auctionId, bidder, amount } = req;
+    console.log(`Received place-bid request with auctionId: ${auctionId}, bidder: ${bidder}, amount: ${amount}`);
+    if (!auctionId || !bidder || isNaN(amount)) {
+      throw new Error('Invalid arguments for place-bid');
+    }
+    const auction = await auctionDB.get(auctionId);
+    if (!auction) throw new Error('Auction not found');
+    auction.value.bids.push({ bidder, amount });
+    await auctionDB.put(auctionId, auction.value);
+    await broadcastAction(rpc, 'place-bid', { auctionId, bidder, amount });
+    return { success: true };
+  });
 
-  await initializeDHTandRPC();
+  rpcServer.respond('close-auction', async (req) => {
+    const { auctionId } = req;
+    console.log(`Received close-auction request with auctionId: ${auctionId}`);
+    if (!auctionId) {
+      throw new Error('Invalid arguments for close-auction');
+    }
+    const auction = await auctionDB.get(auctionId);
+    if (!auction) throw new Error('Auction not found');
+    await broadcastAction(rpc, 'close-auction', { auctionId, winner: auction.value.bids.slice(-1)[0] });
+    return { success: true };
+  });
 
-  // public key of rpc server, used instead of address, the address is discovered via dht
-  const serverPubKey = Buffer.from('a77a555d9e6484ffcdf9ab1a5faf71bf5bbf9109027b106c9678cb8ddaba4597', 'hex');
+  await rpcServer.listen();
+  console.log('RPC server listening on public key:', rpcServer.publicKey.toString('hex'));
 
-  // Example retry mechanism for a file operation
-  let retryCount = 0;
-  const maxRetries = 5;
+  // Example client operations
+  const serverPubKey = Buffer.from('b21f4e64aa092f0600a1a561022ac91a5492d12a3364538beba664892265bade', 'hex');
 
-  while (retryCount < maxRetries) {
+  await retry(async () => {
     try {
-      // Your RPC operation that might fail due to channel issues
-      await auction.openAuction(rpc, serverPubKey, 'client1', 'auction1', 'Pic#1', 75);
-      break; // Exit the loop if successful
+      const auctionId = 'auction1';
+      const item = 'Pic#1';
+      const startingBid = 75;
+      if (isNaN(startingBid)) {
+        throw new Error('Starting bid must be a valid number');
+      }
+      console.log(`Requesting open-auction with auctionId: ${auctionId}, item: ${item}, startingBid: ${startingBid}`);
+      await rpc.request(serverPubKey, 'open-auction', { auctionId, item, startingBid });
     } catch (err) {
+      console.error('Error during open-auction request:', err);
       if (err.message.includes('CHANNEL_CLOSED')) {
-        await handleChannelClosed(); // Implement a function to handle channel closed
+        await handleChannelClosed(dht, rpc);
       } else if (err.code === 'ELOCKED') {
         console.error('File is locked, retrying...', err);
-        retryCount++;
-      } else {
-        throw err; // Rethrow other errors
+        throw err;
       }
+      throw err;
     }
-  }
+  }, {
+    retries: 5,
+    minTimeout: 1000,
+    factor: 2,
+    onRetry: (err, attempt) => {
+      console.log(`Retry attempt ${attempt} due to error: ${err.message}`);
+    }
+  });
 
-  if (retryCount === maxRetries) {
-    console.error('Max retry attempts reached. Unable to proceed.');
-    return;
-  }
+  await rpc.request(serverPubKey, 'place-bid', { auctionId: 'auction1', bidder: 'client2', amount: 75.5 });
+  await rpc.request(serverPubKey, 'close-auction', { auctionId: 'auction1' });
 
-  await auction.placeBid(rpc, serverPubKey, 'auction1', 'client2', 75.5);
-  await auction.closeAuction(rpc, serverPubKey, 'auction1');
-
-  // closing connection
   await rpc.destroy();
   await dht.destroy();
+};
+
+const broadcastAction = async (rpc, action, data) => {
+  for (const peer of peers) {
+    try {
+      console.log(`Broadcasting action ${action} to peer ${peer.toString('hex')} with data: ${JSON.stringify(data)}`);
+      await rpc.request(peer, action, data);
+    } catch (err) {
+      console.error(`Failed to broadcast action to peer ${peer.toString('hex')}:`, err);
+    }
+  }
+};
+
+const handleChannelClosed = async (dht, rpc) => {
+  console.log('Handling CHANNEL_CLOSED error');
+  await rpc.destroy();
+  await dht.destroy();
+  await initializeDHTandRPC();
 };
 
 main().catch(console.error);
