@@ -10,7 +10,14 @@ const main = async () => {
   // hyperbee db
   const hcore = new Hypercore('./db/rpc-server');
   const hbee = new Hyperbee(hcore, { keyEncoding: 'utf-8', valueEncoding: 'json' });
-  await hbee.ready();
+
+  // Wait for hyperbee to be ready
+  try {
+    await hbee.ready();
+  } catch (err) {
+    console.error('Failed to initialize Hyperbee:', err);
+    process.exit(1);
+  }
 
   // resolved distributed hash table seed for key pair
   let dhtSeed = (await hbee.get('dht-seed'))?.value;

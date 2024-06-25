@@ -5,7 +5,6 @@ const DHT = require('hyperdht');
 const crypto = require('crypto');
 const Hyperbee = require('hyperbee');
 const auction = require('./auction');
-const fs = require('fs');
 const retry = require('async-retry');
 
 const main = async () => {
@@ -46,26 +45,30 @@ const main = async () => {
   const serverPubKey = Buffer.from('a77a555d9e6484ffcdf9ab1a5faf71bf5bbf9109027b106c9678cb8ddaba4597', 'hex');
 
   // Example retry mechanism for a file operation
-  await retry(async () => {
+  let retryCount = 0;
+  const maxRetries = 5;
+
+  while (retryCount < maxRetries) {
     try {
       // Your RPC operation that might fail due to channel issues
       await auction.openAuction(rpc, serverPubKey, 'client1', 'auction1', 'Pic#1', 75);
+      break; // Exit the loop if successful
     } catch (err) {
       if (err.message.includes('CHANNEL_CLOSED')) {
         await handleChannelClosed(); // Implement a function to handle channel closed
       } else if (err.code === 'ELOCKED') {
-        throw err; // Throw to trigger the retry
+        console.error('File is locked, retrying...', err);
+        retryCount++;
+      } else {
+        throw err; // Rethrow other errors
       }
-      throw err; // Rethrow other errors
     }
-  }, {
-    retries: 5, // Number of retry attempts
-    minTimeout: 1000, // Minimum wait time between retries (in milliseconds)
-    factor: 2, // Exponential backoff factor
-    onRetry: (err, attempt) => {
-      console.log(`Retry attempt ${attempt} due to error: ${err.message}`);
-    }
-  });
+  }
+
+  if (retryCount === maxRetries) {
+    console.error('Max retry attempts reached. Unable to proceed.');
+    return;
+  }
 
   await auction.placeBid(rpc, serverPubKey, 'auction1', 'client2', 75.5);
   await auction.closeAuction(rpc, serverPubKey, 'auction1');
@@ -76,4 +79,3 @@ const main = async () => {
 };
 
 main().catch(console.error);
-
