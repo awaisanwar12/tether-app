@@ -12,6 +12,8 @@
   "license": "ISC",
   "dependencies": {
     "@hyperswarm/rpc": "^3.3.2",
+    "async-retry": "^1.3.3",
+    "crypto": "^1.0.1",
     "hyperbee": "^2.19.7",
     "hypercore": "^10.37.8",
     "hyperdht": "^6.15.1"
